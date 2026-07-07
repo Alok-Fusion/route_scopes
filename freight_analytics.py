@@ -316,6 +316,180 @@ def clean_dataset(df_raw):
     print(f"Cleaned dataset saved to {DATA_CLEANED_PATH}. Final size: {len(df)} rows.")
     return df
 
+def load_data_to_sqlite(df, db_path=DB_PATH):
+    """Loads cleaned dataframe into local SQLite database."""
+    print("\n--- Loading cleaned data into SQLite database ---")
+    conn = sqlite3.connect(db_path)
+    df.to_sql('freight_orders', conn, if_exists='replace', index=False)
+    conn.commit()
+    print(f"Loaded {len(df)} rows into table 'freight_orders' in SQLite database '{db_path}'.")
+    conn.close()
+
+def run_sql_queries(db_path=DB_PATH):
+    """Executes the raw SQL queries and prints formatted results and interpretations."""
+    print("\n--- Executing Database Analysis & SQL Queries ---")
+    conn = sqlite3.connect(db_path)
+    
+    # Query 1a: On-time delivery by carrier
+    q1a_sql = """
+    SELECT carrier,
+           COUNT(*) as total_orders,
+           SUM(CASE WHEN actual_delivery_date <= promised_delivery_date THEN 1 ELSE 0 END) as on_time_orders,
+           ROUND(CAST(SUM(CASE WHEN actual_delivery_date <= promised_delivery_date THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) * 100, 2) as on_time_percentage
+    FROM freight_orders
+    WHERE actual_delivery_date IS NOT NULL
+    GROUP BY carrier
+    ORDER BY on_time_percentage DESC;
+    """
+    
+    # Query 1b: On-time delivery by shipping mode
+    q1b_sql = """
+    SELECT shipping_mode,
+           COUNT(*) as total_orders,
+           SUM(CASE WHEN actual_delivery_date <= promised_delivery_date THEN 1 ELSE 0 END) as on_time_orders,
+           ROUND(CAST(SUM(CASE WHEN actual_delivery_date <= promised_delivery_date THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) * 100, 2) as on_time_percentage
+    FROM freight_orders
+    WHERE actual_delivery_date IS NOT NULL
+    GROUP BY shipping_mode
+    ORDER BY on_time_percentage DESC;
+    """
+    
+    # Query 2: Avg delay by origin-destination route
+    q2_sql = """
+    SELECT origin_region, destination_region,
+           ROUND(AVG(julianday(actual_delivery_date) - julianday(promised_delivery_date)), 2) as avg_delay_days,
+           COUNT(*) as total_orders
+    FROM freight_orders
+    WHERE actual_delivery_date IS NOT NULL
+    GROUP BY origin_region, destination_region
+    ORDER BY avg_delay_days DESC;
+    """
+    
+    # Query 3: Freight cost as % of order value by carrier
+    q3_sql = """
+    SELECT carrier,
+           ROUND(AVG((freight_cost / order_value) * 100), 2) as avg_freight_cost_pct,
+           ROUND(AVG(freight_cost), 2) as avg_freight_cost_inr
+    FROM freight_orders
+    GROUP BY carrier
+    ORDER BY avg_freight_cost_pct DESC;
+    """
+    
+    # Query 4: Month-over-month volume trend
+    q4_sql = """
+    SELECT strftime('%Y-%m', order_date) as order_month,
+           COUNT(*) as total_orders,
+           ROUND(AVG(julianday(actual_delivery_date) - julianday(promised_delivery_date)), 2) as avg_delay_days
+    FROM freight_orders
+    GROUP BY order_month
+    ORDER BY order_month;
+    """
+    
+    # Query 5: CTE for top 5 worst routes
+    q5_sql = """
+    WITH route_delays AS (
+        SELECT origin_region, destination_region,
+               AVG(julianday(actual_delivery_date) - julianday(promised_delivery_date)) as avg_delay,
+               COUNT(*) as total_orders
+        FROM freight_orders
+        WHERE actual_delivery_date IS NOT NULL
+        GROUP BY origin_region, destination_region
+    )
+    SELECT origin_region, destination_region,
+           ROUND(avg_delay, 2) as avg_delay_days,
+           total_orders,
+           RANK() OVER (ORDER BY avg_delay DESC) as delay_rank
+    FROM route_delays
+    ORDER BY delay_rank ASC
+    LIMIT 5;
+    """
+    
+    # Query 6: Window function - running average delay per carrier by month
+    q6_sql = """
+    WITH monthly_carrier_performance AS (
+        SELECT carrier,
+               strftime('%Y-%m', order_date) as order_month,
+               AVG(julianday(actual_delivery_date) - julianday(promised_delivery_date)) as avg_delay
+        FROM freight_orders
+        WHERE actual_delivery_date IS NOT NULL
+        GROUP BY carrier, order_month
+    )
+    SELECT carrier,
+           order_month,
+           ROUND(avg_delay, 2) as monthly_avg_delay,
+           ROUND(AVG(avg_delay) OVER (
+               PARTITION BY carrier
+               ORDER BY order_month
+               ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+           ), 2) as rolling_3m_avg_delay
+    FROM monthly_carrier_performance
+    ORDER BY carrier, order_month;
+    """
+    
+    # Query 7: Highest avg freight cost relative to order value by customer segment
+    q7_sql = """
+    SELECT customer_segment,
+           ROUND(AVG((freight_cost / order_value) * 100), 2) as avg_freight_cost_pct,
+           ROUND(AVG(freight_cost), 2) as avg_freight_cost_inr,
+           ROUND(AVG(order_value), 2) as avg_order_value_inr,
+           COUNT(*) as total_orders
+    FROM freight_orders
+    GROUP BY customer_segment
+    ORDER BY avg_freight_cost_pct DESC;
+    """
+    
+    queries = [
+        ("Query a(i): On-time Delivery % by Carrier", q1a_sql, 
+         lambda df: f"Business Interpretation: {df.iloc[0]['carrier']} leads network reliability with {df.iloc[0]['on_time_percentage']}% on-time performance, while {df.iloc[-1]['carrier']} lags at {df.iloc[-1]['on_time_percentage']}%."),
+        
+        ("Query a(ii): On-time Delivery % by Shipping Mode", q1b_sql, 
+         lambda df: f"Business Interpretation: {df.iloc[0]['shipping_mode']} exhibits the highest on-time rate ({df.iloc[0]['on_time_percentage']}%), whereas {df.iloc[-1]['shipping_mode']} has the lowest ({df.iloc[-1]['on_time_percentage']}%) due to long-haul complexities."),
+        
+        ("Query b: Average Delay by Route Corridor (Worst to Best)", q2_sql, 
+         lambda df: f"Business Interpretation: The {df.iloc[0]['origin_region']} to {df.iloc[0]['destination_region']} corridor is the most delayed route, averaging {df.iloc[0]['avg_delay_days']} days of delay per shipment."),
+        
+        ("Query c: Freight Cost as % of Order Value by Carrier", q3_sql, 
+         lambda df: f"Business Interpretation: {df.iloc[0]['carrier']} incurs the highest proportional cost at {df.iloc[0]['avg_freight_cost_pct']}% of order value, suggesting premium charging or inefficient route structures."),
+        
+        ("Query d: Month-over-Month Order Volume Trend", q4_sql, 
+         lambda df: f"Business Interpretation: Network volume peaked in {df.loc[df['total_orders'].idxmax(), 'order_month']} with {df.loc[df['total_orders'].idxmax(), 'total_orders']} orders, matching seasonal shipping rushes."),
+        
+        ("Query e: Top 5 Worst Routes (Ranked via CTE & Window Rank)", q5_sql, 
+         lambda df: f"Business Interpretation: Underperforming routes are topped by {df.iloc[0]['origin_region']}-{df.iloc[0]['destination_region']} (Rank {df.iloc[0]['delay_rank']}, delay {df.iloc[0]['avg_delay_days']} days), identifying key lanes requiring capacity reallocation."),
+        
+        ("Query f: Rolling 3-Month Average Delay per Carrier (Window Function)", q6_sql, 
+         lambda df: f"Business Interpretation: Carrier {df.loc[df['rolling_3m_avg_delay'].idxmax(), 'carrier']} experienced the highest rolling 3-month delay of {df.loc[df['rolling_3m_avg_delay'].idxmax(), 'rolling_3m_avg_delay']} days in {df.loc[df['rolling_3m_avg_delay'].idxmax(), 'order_month']}, highlighting mid-year service degradation."),
+        
+        ("Query g: Customer Segment Freight Cost % of Order Value", q7_sql, 
+         lambda df: f"Business Interpretation: The {df.iloc[0]['customer_segment']} segment carries the highest relative logistics expense at {df.iloc[0]['avg_freight_cost_pct']}% of product value.")
+    ]
+    
+    results = {}
+    for name, sql, interp in queries:
+        print("\n" + "="*80)
+        print(f"Executing: {name}")
+        print("="*80)
+        print(sql.strip())
+        print("-" * 80)
+        
+        df_res = pd.read_sql_query(sql, conn)
+        # Display the result
+        print(df_res.to_string(index=False))
+        print("-" * 80)
+        
+        # Display business interpretation
+        business_text = interp(df_res)
+        print(business_text)
+        print("="*80 + "\n")
+        
+        results[name] = df_res
+        
+    conn.close()
+    return results
+
 if __name__ == "__main__":
     df_raw = generate_raw_dataset(105000)
     df_clean = clean_dataset(df_raw)
+    load_data_to_sqlite(df_clean)
+    sql_results = run_sql_queries()
+
