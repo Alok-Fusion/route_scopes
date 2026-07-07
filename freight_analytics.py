@@ -487,9 +487,191 @@ def run_sql_queries(db_path=DB_PATH):
     conn.close()
     return results
 
+def generate_dashboard(df_clean):
+    """Generates the multi-panel analytics dashboard and saves individual panels."""
+    print("\n--- Generating Visualization Panels & Dashboard ---")
+    
+    # Pre-processing data for plotting
+    df_plot = df_clean.copy()
+    df_plot['order_date'] = pd.to_datetime(df_plot['order_date'])
+    df_plot['promised_delivery_date'] = pd.to_datetime(df_plot['promised_delivery_date'])
+    df_plot['actual_delivery_date'] = pd.to_datetime(df_plot['actual_delivery_date'])
+    
+    df_delivered = df_plot[df_plot['actual_delivery_date'].notnull()].copy()
+    df_delivered['on_time'] = df_delivered['actual_delivery_date'] <= df_delivered['promised_delivery_date']
+    df_delivered['delay_days'] = (df_delivered['actual_delivery_date'] - df_delivered['promised_delivery_date']).dt.days
+    df_delivered['status'] = df_delivered['on_time'].map({True: 'On-Time', False: 'Late'})
+    
+    # 1. On-time delivery % by carrier (horizontal bar)
+    carrier_otd = df_delivered.groupby('carrier')['on_time'].mean().reset_index()
+    carrier_otd['on_time_pct'] = (carrier_otd['on_time'] * 100).round(2)
+    carrier_otd = carrier_otd.sort_values(by='on_time_pct', ascending=False).reset_index(drop=True)
+    
+    # 4. Monthly trends (dual line)
+    df_plot['order_month'] = df_plot['order_date'].dt.strftime('%Y-%m')
+    monthly_trend = df_plot.groupby('order_month').agg(
+        total_orders=('order_id', 'count'),
+        avg_delay=('actual_delivery_date', lambda x: (x - df_plot.loc[x.index, 'promised_delivery_date']).dt.days.mean())
+    ).reset_index()
+    monthly_trend = monthly_trend.sort_values(by='order_month').reset_index(drop=True)
+    
+    # 5. Route delay heatmap (origin vs destination)
+    route_matrix = df_delivered.groupby(['origin_region', 'destination_region'])['delay_days'].mean().unstack()
+    
+    # 6. Customer segment on-time vs late (stacked bar)
+    segment_status = df_delivered.groupby(['customer_segment', 'status']).size().unstack(fill_value=0)
+    segment_status = segment_status.reindex(['Manufacturing', 'Retail', 'Automotive', 'Pharma'])
+
+    # Set style
+    sns.set_theme(style='whitegrid', context='talk')
+    
+    # Create combined dashboard
+    fig, axes = plt.subplots(3, 2, figsize=(24, 26))
+    fig.suptitle('Freight Operations Analytics Dashboard', fontsize=32, weight='bold', y=0.98)
+    
+    # Panel 1: Carrier On-Time Performance
+    sns.barplot(x='on_time_pct', y='carrier', data=carrier_otd, ax=axes[0, 0], palette='viridis')
+    axes[0, 0].set_title('1. On-Time Delivery Rate (%) by Carrier', weight='bold')
+    axes[0, 0].set_xlabel('On-Time Percentage (%)')
+    axes[0, 0].set_ylabel('Carrier')
+    axes[0, 0].set_xlim(70, 85)
+    for idx, row in carrier_otd.iterrows():
+        axes[0, 0].text(row['on_time_pct'] - 1.5, idx, f"{row['on_time_pct']}%", color='white', ha='center', va='center', weight='bold')
+        
+    # Panel 2: Delay Distribution by Shipping Mode
+    sns.boxplot(x='shipping_mode', y='delay_days', data=df_delivered, ax=axes[0, 1], showfliers=False, palette='Set2')
+    axes[0, 1].set_title('2. Delivery Delay Distribution by Shipping Mode', weight='bold')
+    axes[0, 1].set_xlabel('Shipping Mode')
+    axes[0, 1].set_ylabel('Delay in Days (Actual - Promised)')
+    
+    # Panel 3: Freight Cost vs Order Value (Scatter plot)
+    df_sample = df_plot.sample(n=2000, random_state=42)
+    sns.scatterplot(x='order_value', y='freight_cost', hue='carrier', data=df_sample, ax=axes[1, 0], alpha=0.6, palette='tab10')
+    x_line = np.linspace(0, 500000, 100)
+    axes[1, 0].plot(x_line, 0.10 * x_line, color='red', linestyle='--', linewidth=2, label='10% Healthy Cost Threshold')
+    axes[1, 0].set_title('3. Freight Cost vs Order Value (Sampled)', weight='bold')
+    axes[1, 0].set_xlabel('Order Value (INR)')
+    axes[1, 0].set_ylabel('Freight Cost (INR)')
+    axes[1, 0].legend(fontsize=12, loc='upper left')
+    
+    # Panel 4: Monthly volume and delay trend (dual axis)
+    ax4 = axes[1, 1]
+    color = 'tab:blue'
+    ax4.set_xlabel('Month')
+    ax4.set_ylabel('Order Volume', color=color)
+    sns.lineplot(x='order_month', y='total_orders', data=monthly_trend, marker='o', ax=ax4, color=color, linewidth=3)
+    ax4.tick_params(axis='y', labelcolor=color)
+    ax4.tick_params(axis='x', labelrotation=45)
+    ax4.set_title('4. Monthly Order Volume & Average Delay Trend', weight='bold')
+    
+    ax4_twin = ax4.twinx()
+    color2 = 'tab:orange'
+    ax4_twin.set_ylabel('Avg Delay (Days)', color=color2)
+    sns.lineplot(x='order_month', y='avg_delay', data=monthly_trend, marker='s', ax=ax4_twin, color=color2, linewidth=3)
+    ax4_twin.tick_params(axis='y', labelcolor=color2)
+    ax4_twin.grid(False)
+    
+    # Panel 5: Origin-Destination average delay heatmap
+    sns.heatmap(route_matrix, annot=True, fmt=".2f", cmap='coolwarm', center=0, ax=axes[2, 0], cbar_kws={'label': 'Days'})
+    axes[2, 0].set_title('5. Route Delay Heatmap (Average Delay in Days)', weight='bold')
+    axes[2, 0].set_xlabel('Destination Region')
+    axes[2, 0].set_ylabel('Origin Region')
+    
+    # Panel 6: Segment breakdown (stacked bar)
+    segment_status.plot(kind='bar', stacked=True, ax=axes[2, 1], color=['salmon', 'mediumseagreen'])
+    axes[2, 1].set_title('6. On-Time vs Late Deliveries by Customer Segment', weight='bold')
+    axes[2, 1].set_xlabel('Customer Segment')
+    axes[2, 1].set_ylabel('Order Count')
+    axes[2, 1].legend(title='Status')
+    axes[2, 1].tick_params(axis='x', labelrotation=0)
+    
+    plt.tight_layout()
+    plt.savefig('dashboard.png', dpi=150)
+    print("Combined dashboard image saved to dashboard.png")
+    
+    # Individual Panels Saving
+    # Panel 1:
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+    sns.barplot(x='on_time_pct', y='carrier', data=carrier_otd, ax=ax1, palette='viridis')
+    ax1.set_title('On-Time Delivery Rate (%) by Carrier', weight='bold')
+    ax1.set_xlabel('On-Time Percentage (%)')
+    ax1.set_ylabel('Carrier')
+    ax1.set_xlim(70, 85)
+    for idx, row in carrier_otd.iterrows():
+        ax1.text(row['on_time_pct'] - 1.0, idx, f"{row['on_time_pct']}%", color='white', ha='center', va='center', weight='bold')
+    fig1.tight_layout()
+    fig1.savefig('panel_1_carrier_otd.png', dpi=150)
+    plt.close(fig1)
+    
+    # Panel 2:
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    sns.boxplot(x='shipping_mode', y='delay_days', data=df_delivered, ax=ax2, showfliers=False, palette='Set2')
+    ax2.set_title('Delivery Delay Distribution by Shipping Mode', weight='bold')
+    ax2.set_xlabel('Shipping Mode')
+    ax2.set_ylabel('Delay in Days')
+    fig2.tight_layout()
+    fig2.savefig('panel_2_delay_distribution.png', dpi=150)
+    plt.close(fig2)
+    
+    # Panel 3:
+    fig3, ax3 = plt.subplots(figsize=(10, 6))
+    sns.scatterplot(x='order_value', y='freight_cost', hue='carrier', data=df_sample, ax=ax3, alpha=0.6, palette='tab10')
+    ax3.plot(x_line, 0.10 * x_line, color='red', linestyle='--', linewidth=2, label='10% Healthy Cost Threshold')
+    ax3.set_title('Freight Cost vs Order Value (Sampled)', weight='bold')
+    ax3.set_xlabel('Order Value (INR)')
+    ax3.set_ylabel('Freight Cost (INR)')
+    ax3.legend(fontsize=10)
+    fig3.tight_layout()
+    fig3.savefig('panel_3_cost_vs_value.png', dpi=150)
+    plt.close(fig3)
+    
+    # Panel 4:
+    fig4, ax4 = plt.subplots(figsize=(10, 6))
+    ax4.set_xlabel('Month')
+    ax4.set_ylabel('Order Volume', color='tab:blue')
+    sns.lineplot(x='order_month', y='total_orders', data=monthly_trend, marker='o', ax=ax4, color='tab:blue', linewidth=3)
+    ax4.tick_params(axis='y', labelcolor='tab:blue')
+    ax4.tick_params(axis='x', labelrotation=45)
+    ax4_twin = ax4.twinx()
+    ax4_twin.set_ylabel('Avg Delay (Days)', color='tab:orange')
+    sns.lineplot(x='order_month', y='avg_delay', data=monthly_trend, marker='s', ax=ax4_twin, color='tab:orange', linewidth=3)
+    ax4_twin.tick_params(axis='y', labelcolor='tab:orange')
+    ax4_twin.grid(False)
+    ax4.set_title('Monthly Order Volume & Average Delay Trend', weight='bold')
+    fig4.tight_layout()
+    fig4.savefig('panel_4_monthly_trends.png', dpi=150)
+    plt.close(fig4)
+    
+    # Panel 5:
+    fig5, ax5 = plt.subplots(figsize=(10, 8))
+    sns.heatmap(route_matrix, annot=True, fmt=".2f", cmap='coolwarm', center=0, ax=ax5, cbar_kws={'label': 'Days'})
+    ax5.set_title('Route Delay Heatmap (Average Delay in Days)', weight='bold')
+    ax5.set_xlabel('Destination Region')
+    ax5.set_ylabel('Origin Region')
+    fig5.tight_layout()
+    fig5.savefig('panel_5_route_heatmap.png', dpi=150)
+    plt.close(fig5)
+    
+    # Panel 6:
+    fig6, ax6 = plt.subplots(figsize=(10, 6))
+    segment_status.plot(kind='bar', stacked=True, ax=ax6, color=['salmon', 'mediumseagreen'])
+    ax6.set_title('On-Time vs Late Deliveries by Customer Segment', weight='bold')
+    ax6.set_xlabel('Customer Segment')
+    ax6.set_ylabel('Order Count')
+    ax6.legend(title='Status')
+    ax6.tick_params(axis='x', labelrotation=0)
+    fig6.tight_layout()
+    fig6.savefig('panel_6_segment_breakdown.png', dpi=150)
+    plt.close(fig6)
+    
+    plt.close('all')
+    print("Individual visualization panels saved as panel_1_... to panel_6_...")
+
 if __name__ == "__main__":
     df_raw = generate_raw_dataset(105000)
     df_clean = clean_dataset(df_raw)
     load_data_to_sqlite(df_clean)
     sql_results = run_sql_queries()
+    generate_dashboard(df_clean)
+
 
